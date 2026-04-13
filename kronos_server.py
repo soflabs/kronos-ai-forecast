@@ -27,33 +27,88 @@ except Exception as e:
     print(f"[Kronos] Model fout: {e}")
     KRONOS_OK = False
 
-# ── Exchange ─────────────────────────────────────────────────────────
-# data-api.binance.vision = publieke marktdata zonder geo-restricties
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'hostname': 'data-api.binance.vision',
-})
+# ── Exchanges (3 grootste, met fallback) ─────────────────────────────
+exchanges = {
+    'bybit':   ccxt.bybit({'enableRateLimit': True}),
+    'binance': ccxt.binance({'enableRateLimit': True}),
+    'kraken':  ccxt.kraken({'enableRateLimit': True}),
+}
+# Primaire exchange voor OHLCV (Bybit werkt wereldwijd, geen geo-restricties)
+PRIMARY_EXCHANGE = 'bybit'
 
 # ── Cache: max 1 forecast per symbol per 30 min ─────────────────────
 _cache = {}
 CACHE_TTL = 1800
 
 SYMBOL_MAP = {
-    'XAGUSD': 'PAXGUSDT',
-    'XAUUSD': 'PAXGUSDT',
+    'XAGUSD':  'PAXGUSDT',
+    'XAUUSD':  'PAXGUSDT',
 }
 
-def get_binance_symbol(symbol):
-    return SYMBOL_MAP.get(symbol.upper(), symbol.upper())
+# Kraken gebruikt andere symboolnamen
+KRAKEN_MAP = {
+    'BTC/USDT': 'BTC/USDT',
+    'XRP/USDT': 'XRP/USDT',
+    'HBAR/USDT': 'HBAR/USDT',
+    'VET/USDT': 'VET/USDT',
+    'PAXG/USDT': 'PAXG/USDT',
+}
+
+def get_trading_pair(symbol):
+    mapped = SYMBOL_MAP.get(symbol.upper(), symbol.upper())
+    return mapped.replace('USDT', '/USDT')
 
 
 def fetch_ohlcv(symbol, lookback=450):
-    binance_sym = get_binance_symbol(symbol)
-    pair = binance_sym.replace('USDT', '/USDT')
-    ohlcv = exchange.fetch_ohlcv(pair, timeframe='4h', limit=lookback)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamps'] = pd.to_datetime(df['timestamp'], unit='ms')
-    return df
+    """Haal OHLCV data op met fallback over 3 exchanges."""
+    pair = get_trading_pair(symbol)
+    errors = []
+
+    # Probeer exchanges in volgorde
+    for name in [PRIMARY_EXCHANGE, 'binance', 'kraken', 'bybit']:
+        ex = exchanges.get(name)
+        if not ex:
+            continue
+        try:
+            ohlcv = ex.fetch_ohlcv(pair, timeframe='4h', limit=lookback)
+            if ohlcv and len(ohlcv) > 0:
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamps'] = pd.to_datetime(df['timestamp'], unit='ms')
+                print(f"[Kronos] OHLCV via {name}: {pair} ({len(df)} candles)")
+                return df
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            continue
+
+    raise Exception(f"Alle exchanges gefaald voor {pair}: {'; '.join(errors)}")
+
+
+def fetch_multi_exchange_price(symbol):
+    """Haal huidige prijs op van 3 exchanges en vergelijk."""
+    pair = get_trading_pair(symbol)
+    prices = {}
+
+    for name, ex in exchanges.items():
+        try:
+            ticker = ex.fetch_ticker(pair)
+            if ticker and ticker.get('last'):
+                prices[name] = round(float(ticker['last']), 6)
+        except Exception:
+            continue
+
+    if not prices:
+        return None
+
+    avg = round(sum(prices.values()) / len(prices), 6)
+    spread = round(max(prices.values()) - min(prices.values()), 6)
+    spread_pct = round(spread / avg * 100, 3) if avg > 0 else 0
+
+    return {
+        'prices': prices,
+        'avg': avg,
+        'spread': spread,
+        'spread_pct': spread_pct,
+    }
 
 
 def compute_forecast(symbol):
@@ -105,6 +160,9 @@ def compute_forecast(symbol):
         else:
             direction = 'neutral'
 
+        # Multi-exchange prijsvergelijking
+        multi = fetch_multi_exchange_price(symbol)
+
         result = {
             'symbol':    symbol,
             'direction': direction,
@@ -112,6 +170,7 @@ def compute_forecast(symbol):
             'score':     score,
             'forecast':  round(float(forecast_close), 6),
             'current':   round(float(current_close), 6),
+            'exchanges': multi,
         }
 
         _cache[symbol] = {'ts': now, 'data': result}
@@ -131,9 +190,18 @@ def forecast():
     result = compute_forecast(symbol)
     return jsonify(result)
 
+@app.route('/prices')
+def prices():
+    symbol = request.args.get('symbol', 'BTCUSDT').upper()
+    result = fetch_multi_exchange_price(symbol)
+    if result:
+        return jsonify({'symbol': symbol, **result})
+    return jsonify({'symbol': symbol, 'error': 'Geen prijzen beschikbaar'})
+
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'kronos_loaded': KRONOS_OK, 'cached': list(_cache.keys())})
+    return jsonify({'status': 'ok', 'kronos_loaded': KRONOS_OK, 'cached': list(_cache.keys()),
+                    'exchanges': list(exchanges.keys()), 'primary': PRIMARY_EXCHANGE})
 
 @app.route('/cache/clear')
 def clear_cache():
@@ -142,7 +210,8 @@ def clear_cache():
 
 @app.route('/')
 def index():
-    return jsonify({'service': 'Kronos AI Forecast', 'status': 'ok', 'endpoints': ['/forecast?symbol=BTCUSDT', '/health']})
+    return jsonify({'service': 'Kronos AI Forecast', 'status': 'ok',
+                    'endpoints': ['/forecast?symbol=BTCUSDT', '/prices?symbol=BTCUSDT', '/health']})
 
 
 if __name__ == '__main__':
