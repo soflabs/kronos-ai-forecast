@@ -7,8 +7,8 @@ Health:   GET /health
 """
 
 import os
+import requests
 from flask import Flask, jsonify, request
-import ccxt
 import pandas as pd
 import time
 
@@ -27,88 +27,129 @@ except Exception as e:
     print(f"[Kronos] Model fout: {e}")
     KRONOS_OK = False
 
-# ── Exchanges (3 grootste, met fallback) ─────────────────────────────
-exchanges = {
-    'bybit':   ccxt.bybit({'enableRateLimit': True}),
-    'binance': ccxt.binance({'enableRateLimit': True}),
-    'kraken':  ccxt.kraken({'enableRateLimit': True}),
-}
-# Primaire exchange voor OHLCV (Bybit werkt wereldwijd, geen geo-restricties)
-PRIMARY_EXCHANGE = 'bybit'
-
 # ── Cache: max 1 forecast per symbol per 30 min ─────────────────────
 _cache = {}
 CACHE_TTL = 1800
 
+# Symbool mapping naar CryptoCompare formaat
 SYMBOL_MAP = {
-    'XAGUSD':  'PAXGUSDT',
-    'XAUUSD':  'PAXGUSDT',
+    'HBARUSDT': ('HBAR', 'USDT'),
+    'XRPUSDT':  ('XRP', 'USDT'),
+    'VETUSDT':  ('VET', 'USDT'),
+    'BTCUSDT':  ('BTC', 'USDT'),
+    'PAXGUSDT': ('PAXG', 'USDT'),
+    'XAGUSD':   ('PAXG', 'USDT'),
+    'XAUUSD':   ('PAXG', 'USDT'),
 }
 
-# Kraken gebruikt andere symboolnamen
-KRAKEN_MAP = {
-    'BTC/USDT': 'BTC/USDT',
-    'XRP/USDT': 'XRP/USDT',
-    'HBAR/USDT': 'HBAR/USDT',
-    'VET/USDT': 'VET/USDT',
-    'PAXG/USDT': 'PAXG/USDT',
-}
-
-def get_trading_pair(symbol):
-    mapped = SYMBOL_MAP.get(symbol.upper(), symbol.upper())
-    return mapped.replace('USDT', '/USDT')
+def get_cc_pair(symbol):
+    """Vertaal symbol naar CryptoCompare fsym/tsym."""
+    s = symbol.upper()
+    if s in SYMBOL_MAP:
+        return SYMBOL_MAP[s]
+    # Probeer automatisch te splitsen
+    if s.endswith('USDT'):
+        return (s[:-4], 'USDT')
+    if s.endswith('USD'):
+        return (s[:-3], 'USD')
+    return (s, 'USDT')
 
 
 def fetch_ohlcv(symbol, lookback=450):
-    """Haal OHLCV data op met fallback over 3 exchanges."""
-    pair = get_trading_pair(symbol)
+    """Haal OHLCV data op via CryptoCompare (geen geo-restricties)."""
+    fsym, tsym = get_cc_pair(symbol)
     errors = []
 
-    # Probeer exchanges in volgorde
-    for name in [PRIMARY_EXCHANGE, 'binance', 'kraken', 'bybit']:
-        ex = exchanges.get(name)
-        if not ex:
-            continue
-        try:
-            ohlcv = ex.fetch_ohlcv(pair, timeframe='4h', limit=lookback)
-            if ohlcv and len(ohlcv) > 0:
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    # CryptoCompare: 4h candles = hourly met aggregate=4
+    # Max 2000 per call, we vragen lookback candles
+    url = f'https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym={tsym}&limit={lookback * 4}&aggregate=1'
+    try:
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+        if data.get('Response') == 'Success' and data.get('Data', {}).get('Data'):
+            raw = data['Data']['Data']
+            # Groepeer per 4 uur (OHLCV aggregatie)
+            candles = []
+            for i in range(0, len(raw) - 3, 4):
+                chunk = raw[i:i+4]
+                if len(chunk) < 4:
+                    break
+                candles.append({
+                    'timestamp': chunk[0]['time'] * 1000,
+                    'open': chunk[0]['open'],
+                    'high': max(c['high'] for c in chunk),
+                    'low': min(c['low'] for c in chunk),
+                    'close': chunk[-1]['close'],
+                    'volume': sum(c['volumefrom'] for c in chunk),
+                })
+            if len(candles) >= 50:
+                df = pd.DataFrame(candles)
                 df['timestamps'] = pd.to_datetime(df['timestamp'], unit='ms')
-                print(f"[Kronos] OHLCV via {name}: {pair} ({len(df)} candles)")
+                print(f"[Kronos] OHLCV via CryptoCompare: {fsym}/{tsym} ({len(df)} 4h candles)")
                 return df
-        except Exception as e:
-            errors.append(f"{name}: {e}")
-            continue
+            else:
+                errors.append(f"CryptoCompare: te weinig data ({len(candles)} candles)")
+        else:
+            errors.append(f"CryptoCompare: {data.get('Message', 'onbekende fout')}")
+    except Exception as e:
+        errors.append(f"CryptoCompare: {e}")
 
-    raise Exception(f"Alle exchanges gefaald voor {pair}: {'; '.join(errors)}")
+    # Fallback: Binance data-api (proxy, soms minder geo-restrictief)
+    binance_urls = [
+        f'https://data-api.binance.vision/api/v3/klines?symbol={symbol.upper()}&interval=4h&limit={lookback}',
+        f'https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=4h&limit={lookback}',
+    ]
+    for burl in binance_urls:
+        try:
+            resp = requests.get(burl, timeout=10)
+            if resp.status_code == 200:
+                raw = resp.json()
+                if isinstance(raw, list) and len(raw) > 0:
+                    df = pd.DataFrame(raw, columns=[
+                        'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                        'close_time', 'quote_vol', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'
+                    ])
+                    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].astype(float)
+                    df['timestamp'] = df['timestamp'].astype(int)
+                    df['timestamps'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    src = 'Binance-data-api' if 'data-api' in burl else 'Binance'
+                    print(f"[Kronos] OHLCV via {src}: {symbol} ({len(df)} candles)")
+                    return df
+        except Exception as e:
+            errors.append(f"Binance: {e}")
+
+    raise Exception(f"Alle data bronnen gefaald voor {symbol}: {'; '.join(errors)}")
 
 
 def fetch_multi_exchange_price(symbol):
-    """Haal huidige prijs op van 3 exchanges en vergelijk."""
-    pair = get_trading_pair(symbol)
-    prices = {}
+    """Haal huidige prijs op via CryptoCompare (multi-exchange gemiddelde)."""
+    fsym, tsym = get_cc_pair(symbol)
+    try:
+        url = f'https://min-api.cryptocompare.com/data/pricemultifull?fsyms={fsym}&tsyms={tsym}'
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        raw = data.get('RAW', {}).get(fsym, {}).get(tsym, {})
+        if not raw:
+            return None
 
-    for name, ex in exchanges.items():
-        try:
-            ticker = ex.fetch_ticker(pair)
-            if ticker and ticker.get('last'):
-                prices[name] = round(float(ticker['last']), 6)
-        except Exception:
-            continue
+        price = float(raw.get('PRICE', 0))
+        high24 = float(raw.get('HIGH24HOUR', 0))
+        low24 = float(raw.get('LOW24HOUR', 0))
+        volume = float(raw.get('VOLUME24HOUR', 0))
+        market = raw.get('LASTMARKET', 'unknown')
 
-    if not prices:
+        return {
+            'prices': {market: price},
+            'avg': round(price, 6),
+            'spread': round(high24 - low24, 6),
+            'spread_pct': round((high24 - low24) / price * 100, 3) if price > 0 else 0,
+            'high24': round(high24, 6),
+            'low24': round(low24, 6),
+            'volume24': round(volume, 2),
+        }
+    except Exception as e:
+        print(f"[Kronos] Prijs fout {symbol}: {e}")
         return None
-
-    avg = round(sum(prices.values()) / len(prices), 6)
-    spread = round(max(prices.values()) - min(prices.values()), 6)
-    spread_pct = round(spread / avg * 100, 3) if avg > 0 else 0
-
-    return {
-        'prices': prices,
-        'avg': avg,
-        'spread': spread,
-        'spread_pct': spread_pct,
-    }
 
 
 def compute_forecast(symbol):
@@ -201,7 +242,7 @@ def prices():
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok', 'kronos_loaded': KRONOS_OK, 'cached': list(_cache.keys()),
-                    'exchanges': list(exchanges.keys()), 'primary': PRIMARY_EXCHANGE})
+                    'data_source': 'CryptoCompare + Binance fallback'})
 
 @app.route('/cache/clear')
 def clear_cache():
