@@ -28,7 +28,11 @@ except Exception as e:
     KRONOS_OK = False
 
 # ── Exchange ─────────────────────────────────────────────────────────
-exchange = ccxt.binance({'enableRateLimit': True})
+# data-api.binance.vision = publieke marktdata zonder geo-restricties
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'hostname': 'data-api.binance.vision',
+})
 
 # ── Cache: max 1 forecast per symbol per 30 min ─────────────────────
 _cache = {}
