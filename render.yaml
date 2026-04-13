@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: kronos-ai-forecast
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn kronos_server:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
